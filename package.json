@@ -1,0 +1,25 @@
+{
+  "name": "twilight-twitch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A focused, open-source Twitch desktop web client inspired by Twire.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc && cp web/index.html web/styles.css dist/ && cp node_modules/hls.js/dist/hls.min.js dist/",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "dev": "node scripts/server.mjs",
+    "start": "node scripts/server.mjs",
+    "open": "npm run build && node scripts/open.mjs",
+    "check": "npm run typecheck && npm test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "hls.js": "^1.7.4"
+  }
+}
