@@ -37,6 +37,14 @@ The browser plays the stream with `hls.js`. The proxy is required because Twitch
 
 Login-free discovery uses Twitch's public web GraphQL endpoint. It is unofficial and can change without notice; account mode uses the official Helix API.
 
+Move the pointer or tap the video to reveal the controls. During playback the controls and cursor hide after 2.5 seconds of inactivity. Use **Pause** and **Play** to resume from the paused position while it remains buffered or available from Twitch. While paused, Twilight targets up to 120 seconds of video ahead of the playhead. A longer pause can leave a gap if Twitch has already dropped intervening segments. Use **−5s** and **+5s**, or the left and right arrow keys with the player focused, to step through available video while playing or paused. **Go live** jumps to the player's current live playback position and starts playback, including from pause. With the player focused, **L** goes live, **M** toggles sound, and **F** toggles fullscreen.
+
+**Past broadcasts** opens a channel’s published archive by username, including offline channels. Select a broadcast to play it, use the Twitch player’s seek bar, or choose a timestamp and click **Play from here**. Red markers above the timestamp slider and the **Muted sections** list show any reported muted intervals. Connected accounts use the Twitch Helix videos endpoint. The no-login view uses public Twitch metadata, and Twitch may require account mode for older pages.
+
+The broadcast timeline appears with the live player controls. Click or drag it to seek directly into the current broadcast’s published archive. The player reads Twitch’s growing EVENT playlist and buffers new segments during playback. The right end of the bar returns to live. **Go live** switches to the live feed. The archive can trail live while Twitch publishes new segments. Twitch controls archive availability and access. Chat continues showing live messages.
+
+In **Settings → Stream player type**, choose `site` (default) or `embed` for direct live playback, then reopen the channel. This selects the player type sent in the Twitch playback-token request. A configured stream proxy handles its own token.
+
 ## Optional live HLS interval filtering
 
 Start the local server with `HLS_FILTER_ENABLED=true npm run dev` and reopen the channel. The setting applies to direct Twitch and configured stream-proxy playback. Environment variables are read at server startup. Export them in the shell or set them in the process launcher.

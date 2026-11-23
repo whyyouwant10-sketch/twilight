@@ -62,7 +62,48 @@ export function mapGqlStream(node) {
   };
 }
 
-export async function fetchPlaybackToken(login) {
+export async function searchChannels(term) {
+  const data = await gql(`query($term:String!){ searchFor(userQuery:$term,platform:"web"){ channels { items { login displayName avatarUrl: profileImageURL(width:50) stream { id } } } } }`, { term });
+  return (data.searchFor?.channels?.items ?? []).filter(user => sanitizeLogin(user?.login)).slice(0, 10)
+    .map(({ login, displayName, avatarUrl, stream }) => ({ login, displayName, avatarUrl, isLive: Boolean(stream?.id) }));
+}
+
+export async function fetchArchives(login, after = null) {
+  const data = await gql(`query($login:String!,$after:Cursor){
+    user(login:$login){ displayName videos(first:12,after:$after,type:ARCHIVE,sort:TIME){
+      edges { cursor node { id title publishedAt lengthSeconds broadcastType previewThumbnailURL(width:640,height:360)
+        muteInfo { mutedSegmentConnection { nodes { offset duration } } }
+      } } pageInfo { hasNextPage }
+    } }
+  }`, { login, after });
+  if (!data.user) return null;
+  const { edges, pageInfo } = data.user.videos;
+  return {
+    channel: data.user.displayName,
+    videos: edges.map(edge => edge.node).filter(v => v?.broadcastType === "ARCHIVE" && /^\d+$/.test(v.id) && v.lengthSeconds > 0)
+      .map(v => ({ id: String(v.id), title: v.title, publishedAt: v.publishedAt, duration: v.lengthSeconds, thumbnailUrl: v.previewThumbnailURL ?? "",
+        muted: v.muteInfo?.mutedSegmentConnection?.nodes ?? null })),
+    cursor: pageInfo?.hasNextPage ? edges.at(-1)?.cursor ?? null : null,
+  };
+}
+
+export async function fetchBroadcastReplay(channel, streamId, videoId = null) {
+  if (videoId) {
+    // Once the viewer has opened an archive, it may keep growing after the channel goes offline.
+    const { video } = await gql(`query($id:ID!){ video(id:$id){ id lengthSeconds broadcastType owner { login } } }`, { id: videoId });
+    if (video?.id !== videoId || video.owner?.login !== channel || video.broadcastType !== "ARCHIVE" ||
+        !Number.isSafeInteger(video.lengthSeconds) || video.lengthSeconds < 1) return null;
+    return { id: videoId, duration: video.lengthSeconds };
+  }
+  const data = await gql(`query($login:String!){ user(login:$login){ stream { id archiveVideo { id lengthSeconds } } } }`, { login: channel });
+  const stream = data.user?.stream;
+  const video = stream?.archiveVideo;
+  if (String(stream?.id) !== streamId || !video || !/^\d+$/.test(video.id)
+      || !Number.isSafeInteger(video.lengthSeconds) || video.lengthSeconds < 1) return null;
+  return { id: String(video.id), duration: video.lengthSeconds };
+}
+
+export async function fetchPlaybackToken(login, playerType = "site") {
   const channel = sanitizeLogin(login);
   if (!channel) throw new Error("Invalid channel name");
   const response = await fetch(GQL_URL, {
@@ -70,7 +111,7 @@ export async function fetchPlaybackToken(login) {
     headers: { "Client-ID": GQL_CLIENT_ID, "Content-Type": "application/json" },
     body: JSON.stringify({
       operationName: "PlaybackAccessToken",
-      variables: { isLive: true, login: channel, isVod: false, vodID: "", playerType: "site" },
+      variables: { isLive: true, login: channel, isVod: false, vodID: "", playerType },
       extensions: { persistedQuery: { version: 1, sha256Hash: PLAYBACK_QUERY_HASH } },
     }),
   });
@@ -121,8 +162,8 @@ export async function fetchProxiedPlaylist(channel, proxyBase, signal) {
   return { url: finalUrl, text: await playlistText(upstream) };
 }
 
-export async function fetchMasterPlaylist(login, signal) {
-  const { value, signature, channel } = await fetchPlaybackToken(login);
+export async function fetchMasterPlaylist(login, signal, playerType = "site") {
+  const { value, signature, channel } = await fetchPlaybackToken(login, playerType);
   const url = buildUsherUrl(channel, value, signature);
   const { upstream, status } = await relayGet(url, isAllowedTwitchMediaUrl, {}, signal);
   if (status < 200 || status >= 300) {
@@ -176,7 +217,7 @@ export async function fetchMedia(url, headers = {}, proxyBase = "", signal) {
 }
 
 export async function fetchTopStreams(first = 30) {
-  const limit = clampFirst(first);
+  const limit = Math.min(30, clampFirst(first));
   return cached(`streams:${limit}`, async () => {
     const data = await gql(`query($first:Int!){ streams(first:$first){ edges { node { ${STREAM_FIELDS} } } } }`, { first: limit });
     return (data.streams?.edges ?? []).map((edge) => mapGqlStream(edge.node));
@@ -224,10 +265,20 @@ export async function fetchTopGames(first = 24) {
 export async function searchPublicStreams(query, first = 30) {
   const needle = String(query ?? "").trim().toLowerCase();
   if (!needle) return fetchTopStreams(first);
-  const streams = await fetchTopStreams(100);
-  return streams
-    .filter((stream) => `${stream.displayName} ${stream.userName} ${stream.title} ${stream.gameName}`.toLowerCase().includes(needle))
-    .slice(0, clampFirst(first));
+  const [data, featured] = await Promise.all([
+    gql(`query($term:String!){ searchFor(userQuery:$term,platform:"web"){ channels { items { stream { ${STREAM_FIELDS} } } } } }`, { term: needle }),
+    fetchTopStreams(30),
+  ]);
+  const channels = (data.searchFor?.channels?.items ?? [])
+    .filter(user => user?.stream)
+    .map(user => mapGqlStream(user.stream));
+  const matches = featured.filter(stream =>
+    `${stream.displayName} ${stream.userName} ${stream.title} ${stream.gameName}`.toLowerCase().includes(needle));
+  const unique = new Map();
+  for (const stream of [...channels, ...matches]) {
+    if (!unique.has(stream.id)) unique.set(stream.id, stream);
+  }
+  return [...unique.values()].slice(0, clampFirst(first));
 }
 
 export function clearDiscoveryCache() {

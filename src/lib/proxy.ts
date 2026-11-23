@@ -16,9 +16,10 @@ export const streamPresets = [
   "https://as.luminous.dev",
 ];
 
-export function playbackUrl(channel: string, live: boolean, streamProxy: string): string {
+export function playbackUrl(channel: string, live: boolean, streamProxy: string, playerType: AppSettings["playerType"] = "site"): string {
   const params = new URLSearchParams({ channel });
   if (live && streamProxy) params.set("proxy", streamProxy);
+  else if (live && playerType === "embed") params.set("playerType", playerType);
   return `/api/playback?${params}`;
 }
 

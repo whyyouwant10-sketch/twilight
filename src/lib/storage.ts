@@ -7,6 +7,7 @@ export const SETTINGS_KEY = "twilight.settings.v1";
 
 export const defaultSettings = (): AppSettings => ({
   version: 1,
+  playerType: "site",
   streamProxy: "",
   imageProxyEnabled: false,
   imageProxyUrl: defaultImageProxy,
@@ -29,6 +30,7 @@ export function loadSettings(storage: Pick<Storage, "getItem"> = localStorage): 
       ...defaultSettings(),
       ...value,
       version: 1,
+      playerType: value.playerType === "embed" ? "embed" : "site",
       streamProxy: typeof value.streamProxy === "string" && isStreamProxy(value.streamProxy) ? value.streamProxy : "",
       imageProxyEnabled: value.imageProxyEnabled === true,
       imageProxyUrl: typeof value.imageProxyUrl === "string" && isImageProxy(value.imageProxyUrl) ? value.imageProxyUrl : defaultImageProxy,

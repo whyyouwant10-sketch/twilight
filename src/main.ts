@@ -1,3 +1,8 @@
+import { startSessionStats, statsMarkup } from "./lib/session-stats.js";
+import { bindChannelSearch } from "./lib/channel-search.js";
+import { mountArchives } from "./lib/archives.js";
+import { bindBroadcastTimeline, replayUrls, type ReplayPosition } from "./lib/replay.js";
+import { bindPlayerControls } from "./lib/player-controls.js";
 import { createProvider } from "./services/twitch.js";
 import { ServerProvider } from "./services/server.js";
 import { TwitchChatClient, type ChatStatus } from "./services/chat.js";
@@ -11,6 +16,7 @@ import type { AppSettings, Category, ChatMessage, Stream, StreamProvider, View }
 const app = document.querySelector<HTMLDivElement>("#app");
 if (!app) throw new Error("Twilight mount point missing");
 
+const stats = startSessionStats();
 let settings: AppSettings = loadSettings();
 document.documentElement.style.setProperty("--transition", settings.reduceMotion ? "0s" : ".1s");
 let provider: StreamProvider = createProvider(settings.clientId, settings.accessToken);
@@ -21,6 +27,9 @@ let followingStreams: Stream[] = [];
 let categories: Category[] = [];
 let chat: ChatMessage[] = [];
 let selectedStream: Stream | undefined;
+let archiveLogin = "";
+let disposeTimeline: (() => void) | undefined;
+let replayPosition: ReplayPosition | null = null;
 let query = "";
 let activeCategory: string | null = null;
 let loading = false;
@@ -30,8 +39,8 @@ let chatClient: TwitchChatClient | null = null;
 let pendingChat: ChatMessage[] = [];
 let chatFrame: number | undefined;
 let hls: Hls | null = null;
-let playerStreamId: string | null = null;
 let playerRetries = 0;
+let unbindPlayerControls: (() => void) | undefined;
 let toastTimer: number | undefined;
 const redirectUri = `${window.location.origin}/auth/callback`;
 
@@ -100,16 +109,39 @@ function pageHeader(icon: string, title: string, subtitle: string, actions = "")
   return `<header class="page-head"><div class="page-head-icon" aria-hidden="true">${icon}</div><div class="page-head-copy"><h1>${title}</h1><p>${subtitle}</p></div>${actions ? `<div class="page-head-actions">${actions}</div>` : ""}</header>`;
 }
 
+const narrowWatch = window.matchMedia("(max-width: 820px)");
+const panelPreferences = {
+  wide: { navigation: true, chat: true },
+  narrow: { navigation: false, chat: false },
+};
+function syncWatchPanels(): void {
+  const shell = document.querySelector<HTMLElement>(".watch-shell");
+  if (!shell) return;
+  const state = panelPreferences[narrowWatch.matches ? "narrow" : "wide"];
+  for (const panel of ["navigation", "chat"] as const) {
+    const button = shell.querySelector<HTMLButtonElement>(`[data-panel="${panel}"]`)!;
+    const open = state[panel];
+    shell.classList.toggle(`collapsed-${panel}`, !open);
+    button.textContent = (panel === "navigation") === open ? "‹" : "›";
+    button.setAttribute("aria-expanded", String(open));
+    button.title = `${open ? "Collapse" : "Expand"} ${panel}`;
+    button.setAttribute("aria-label", button.title);
+  }
+}
+narrowWatch.addEventListener("change", syncWatchPanels);
+
 function layout(content: string): string {
-  return `<div class="app-shell">
-    <aside class="sidebar" aria-label="Primary navigation">
+  const watching = view === "watch" && !!selectedStream;
+  const arrow = (panel: "navigation" | "chat") => watching ? `<button class="panel-arrow" data-panel="${panel}" aria-controls="watch-${panel}"></button>` : "";
+  return `<div class="app-shell${watching ? " watch-shell" : ""}">
+    <aside id="watch-navigation" class="sidebar" aria-label="Primary navigation">
       <div class="brand"><div class="brand-mark" aria-hidden="true">✦</div><div class="brand-copy"><div class="brand-name">Twilight</div><div class="brand-tagline">Twitch, focused.</div></div></div>
       <div class="nav-group"><div class="nav-label">Discover</div>${navButton("home", "⌂", "Featured")}${navButton("following", "♡", "Following")}${navButton("browse", "◈", "Top games")}</div>
-      <div class="nav-group"><div class="nav-label">Library</div>${navButton("watch", "▶", "Now playing")}${navButton("settings", "⚙", "Settings")}</div>
+      <div class="nav-group"><div class="nav-label">Library</div>${navButton("archives", "◷", "Past broadcasts")}${navButton("watch", "▶", "Now playing")}${navButton("settings", "⚙", "Settings")}</div>
       <div class="sidebar-footer"><strong>${providerLabel()}</strong><br />No ads injected by this client.<br />${settings.streamProxy || settings.imageProxyEnabled ? "Proxy settings apply on this device." : "Twitch content stays with Twitch."}</div>
     </aside>
-    <main class="main"><header class="topbar"><form class="search" id="search-form" role="search"><span aria-hidden="true">⌕</span><input id="search-input" value="${escapeHtml(query)}" placeholder="Search streams, channels, categories" aria-label="Search Twitch" /><kbd>/</kbd></form><div class="topbar-spacer"></div><span class="pill ${provider.mode === "demo" ? "demo" : ""}">${providerPill()}</span></header><div class="content">${content}</div></main>
-    <nav class="tabbar" aria-label="Primary navigation">${tabButton("home", "⌂", "Featured")}${tabButton("following", "♡", "Following")}${tabButton("browse", "◈", "Games")}${tabButton("watch", "▶", "Playing")}${tabButton("settings", "⚙", "Settings")}</nav>
+    <main class="main"><header class="topbar">${arrow("navigation")}<form class="search" id="search-form" role="search"><span aria-hidden="true">⌕</span><input id="search-input" value="${escapeHtml(query)}" placeholder="Search streams, channels, categories" aria-label="Search Twitch" /><kbd>/</kbd></form><div class="topbar-spacer"></div><span class="pill ${provider.mode === "demo" ? "demo" : ""}">${providerPill()}</span>${statsMarkup}${arrow("chat")}</header><div class="content">${content}</div></main>
+    <nav class="tabbar" aria-label="Primary navigation">${tabButton("home", "⌂", "Featured")}${tabButton("following", "♡", "Following")}${tabButton("browse", "◈", "Games")}${tabButton("archives", "◷", "VODs")}${tabButton("watch", "▶", "Playing")}${tabButton("settings", "⚙", "Settings")}</nav>
   </div>`;
 }
 
@@ -182,7 +214,12 @@ function watchView(): string {
   const player = provider.mode === "demo"
     ? `<div class="demo-player"><div class="demo-copy"><span class="play">▶</span><strong>Demo player ready</strong><p>Live mode plays current Twitch streams here.</p></div></div>`
     : `<video id="player-video" class="hls-video" playsinline autoplay poster="${escapeHtml(imageUrl(selectedStream.thumbnailUrl, settings))}" title="Twitch stream for ${escapeHtml(selectedStream.displayName)}"></video>`;
-  return `<div class="watch-layout"><section class="player-panel"><div class="player">${player}</div><div class="player-controls"><button data-player="play" aria-label="Play or pause">▶ / ❚❚</button><button data-player="mute" aria-label="Mute or unmute">🔊</button><select id="quality-select" aria-label="Playback quality"><option value="-1">Auto quality</option></select><button data-player="pip" aria-label="Picture in picture">⧉</button><div class="controls-spacer"></div><span class="latency-indicator"><span class="status-dot"></span>${settings.lowLatency ? "Low latency" : "Stable buffer"}</span><button data-player="fullscreen" aria-label="Fullscreen">⛶</button></div><div class="stream-info"><div class="stream-info-row"><div><div class="eyebrow">Live channel</div><h2>${escapeHtml(selectedStream.displayName)}</h2></div><button class="favorite ${isFavorite(selectedStream) ? "saved" : ""}" data-favorite="${escapeHtml(selectedStream.userName)}" aria-label="Favorite ${escapeHtml(selectedStream.displayName)}">${isFavorite(selectedStream) ? "★" : "☆"}</button></div><p>${escapeHtml(selectedStream.title)}</p><div class="tag-row">${selectedStream.tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div><div class="hero-actions"><button class="ghost" data-open-twitch="${escapeHtml(selectedStream.userName)}">Open on Twitch</button></div></div></section>${chatPanel()}</div>`;
+
+  return `<div class="watch-layout"><section class="player-panel"><div class="player-shell" tabindex="0" role="group" aria-label="Stream player"><div class="player">${player}</div>${provider.mode === "demo" ? "" : `<div class="live-overlay"><div class="broadcast-timeline"><input id="broadcast-time" type="range" aria-label="Broadcast timeline" min="0" max="0" value="0" step="1" disabled><output for="broadcast-time" id="broadcast-clock"></output></div><div class="player-controls" role="group" aria-label="Playback controls">
+    <div class="transport-group"><button data-player="play" title="Play or pause" disabled>Play</button><button data-player="back" aria-label="Back 5 seconds" title="Back 5 seconds (←)" disabled>−5s</button><button data-player="forward" aria-label="Forward 5 seconds" title="Forward 5 seconds (→)" disabled>+5s</button><button data-player="live" title="Jump to the live edge (L)" disabled>Go live</button><a id="open-current-replay" target="_blank" rel="noopener noreferrer" hidden>Open replay on Twitch</a><span class="playback-status">Connecting…</span></div>
+    <div class="sound-group"><button data-player="mute" title="Toggle sound (M)">Mute</button><input class="player-volume" type="range" min="0" max="1" step="0.01" aria-label="Volume"></div>
+    <div class="view-group"><select id="quality-select" aria-label="Playback quality"><option value="-1">Auto quality</option></select><button data-player="pip" title="Picture in picture" aria-label="Picture in picture">PiP</button><button data-player="fullscreen" title="Toggle fullscreen (F)">Fullscreen</button></div>
+  </div></div>`}</div><div class="stream-info"><div class="stream-info-row"><div><div class="eyebrow">Live channel</div><h2>${escapeHtml(selectedStream.displayName)}</h2></div><button class="favorite ${isFavorite(selectedStream) ? "saved" : ""}" data-favorite="${escapeHtml(selectedStream.userName)}" aria-label="Favorite ${escapeHtml(selectedStream.displayName)}">${isFavorite(selectedStream) ? "★" : "☆"}</button></div><p>${escapeHtml(selectedStream.title)}</p><div class="tag-row">${selectedStream.tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div><div class="hero-actions">${provider.mode === "demo" ? "" : `<button class="ghost" data-archives>Past broadcasts</button>`}<button class="ghost" data-open-twitch="${escapeHtml(selectedStream.userName)}">Open on Twitch</button></div></div></section>${chatPanel()}</div>`;
 }
 
 function chatPanel(): string {
@@ -190,7 +227,7 @@ function chatPanel(): string {
   const body = chat.length
     ? chat.slice(-80).map(messageRow).join("")
     : `<div class="empty"><strong>${provider.mode === "demo" ? "Demo chat" : "Connecting to chat"}</strong>${provider.mode === "demo" ? "Sample messages from the demo provider." : "Live chat connects over Twitch IRC when a channel opens."}</div>`;
-  return `<aside class="chat-panel" aria-label="Stream chat"><div class="chat-header"><h3>Live chat</h3><span class="muted small chat-status">${statusLabel}</span></div><div class="chat-messages">${body}</div><div class="chat-footer">Chat messages are rendered as text. Links and HTML are not executed.</div></aside>`;
+  return `<aside id="watch-chat" class="chat-panel" aria-label="Stream chat"><div class="chat-header"><h3>Live chat</h3><span class="muted small chat-status">${statusLabel}</span></div><div class="chat-messages">${body}</div><div class="chat-footer">Chat messages are rendered as text. Links and HTML are not executed.</div></aside>`;
 }
 
 function proxySettings(): string {
@@ -209,13 +246,15 @@ function proxySettings(): string {
 }
 
 function settingsView(): string {
-  return pageHeader("⚙", "Settings", "Keep the experience light, local, and in your control.") + `<div class="settings-layout"><div class="notice">${provider.mode === "demo" ? "Demo mode is active. Add a Twitch Client ID and connect below to load live streams." : "Live Twitch mode is active. Your credentials stay in this browser profile and are never sent anywhere except Twitch API requests."}</div><section class="settings-card"><div class="setting"><div><label for="client-id">Twitch Client ID</label><p>Create an application in the Twitch developer console and paste its public client ID.</p></div><input id="client-id" type="text" value="${escapeHtml(settings.clientId)}" placeholder="Client ID" autocomplete="off" /></div><div class="setting"><div><label for="access-token">Access token</label><p>Optional if you use Connect Twitch. It is never written to logs.</p></div><input id="access-token" type="password" value="${escapeHtml(settings.accessToken)}" placeholder="Optional token" autocomplete="off" /></div><div class="setting"><div><label>Authentication</label><p>Use Twitch's browser consent screen. The callback is handled locally and the returned token is kept in this browser profile.</p></div><button class="primary" id="connect-twitch">Connect Twitch</button></div><div class="setting"><div><label for="quality">Default quality</label><p>Auto adapts to your connection; lower quality can reduce buffering.</p></div><select id="default-quality"><option value="auto" ${settings.quality === "auto" ? "selected" : ""}>Auto</option><option value="1080p" ${settings.quality === "1080p" ? "selected" : ""}>1080p</option><option value="720p" ${settings.quality === "720p" ? "selected" : ""}>720p</option><option value="480p" ${settings.quality === "480p" ? "selected" : ""}>480p</option><option value="360p" ${settings.quality === "360p" ? "selected" : ""}>360p</option></select></div><div class="setting"><div><label for="low-latency">Prefer low latency</label><p>Stay closer to the live edge when the network can sustain it.</p></div><label class="switch"><input id="low-latency" type="checkbox" ${settings.lowLatency ? "checked" : ""} /><span class="slider"></span></label></div><div class="setting"><div><label for="reduce-motion">Reduce motion</label><p>Use a calmer interface with fewer hover and transition effects.</p></div><label class="switch"><input id="reduce-motion" type="checkbox" ${settings.reduceMotion ? "checked" : ""} /><span class="slider"></span></label></div><div class="setting"><div><label>Session</label><p>Credentials can be cleared from this browser profile at any time.</p></div><button class="danger" id="clear-settings">Clear local settings</button></div></section>${proxySettings()}</div>`;
+  return pageHeader("⚙", "Settings", "Keep the experience light, local, and in your control.") + `<div class="settings-layout"><div class="notice">${provider.mode === "demo" ? "Demo mode is active. Add a Twitch Client ID and connect below to load live streams." : "Live Twitch mode is active. Your credentials stay in this browser profile and are never sent anywhere except Twitch API requests."}</div><section class="settings-card"><div class="setting"><div><label for="client-id">Twitch Client ID</label><p>Create an application in the Twitch developer console and paste its public client ID.</p></div><input id="client-id" type="text" value="${escapeHtml(settings.clientId)}" placeholder="Client ID" autocomplete="off" /></div><div class="setting"><div><label for="access-token">Access token</label><p>Optional if you use Connect Twitch. It is never written to logs.</p></div><input id="access-token" type="password" value="${escapeHtml(settings.accessToken)}" placeholder="Optional token" autocomplete="off" /></div><div class="setting"><div><label>Authentication</label><p>Use Twitch's browser consent screen. The callback is handled locally and the returned token is kept in this browser profile.</p></div><button class="primary" id="connect-twitch">Connect Twitch</button></div><div class="setting"><div><label for="player-type">Stream player type</label><p>Applies the next time you open a live channel with the stream proxy disabled.</p></div><select id="player-type"><option value="site" ${settings.playerType === "site" ? "selected" : ""}>site</option><option value="embed" ${settings.playerType === "embed" ? "selected" : ""}>embed</option></select></div><div class="setting"><div><label for="quality">Default quality</label><p>Auto adapts to your connection; lower quality can reduce buffering.</p></div><select id="default-quality"><option value="auto" ${settings.quality === "auto" ? "selected" : ""}>Auto</option><option value="1080p" ${settings.quality === "1080p" ? "selected" : ""}>1080p</option><option value="720p" ${settings.quality === "720p" ? "selected" : ""}>720p</option><option value="480p" ${settings.quality === "480p" ? "selected" : ""}>480p</option><option value="360p" ${settings.quality === "360p" ? "selected" : ""}>360p</option></select></div><div class="setting"><div><label for="low-latency">Prefer low latency</label><p>Stay closer to the live edge when the network can sustain it.</p></div><label class="switch"><input id="low-latency" type="checkbox" ${settings.lowLatency ? "checked" : ""} /><span class="slider"></span></label></div><div class="setting"><div><label for="reduce-motion">Reduce motion</label><p>Use a calmer interface with fewer hover and transition effects.</p></div><label class="switch"><input id="reduce-motion" type="checkbox" ${settings.reduceMotion ? "checked" : ""} /><span class="slider"></span></label></div><div class="setting"><div><label>Session</label><p>Credentials can be cleared from this browser profile at any time.</p></div><button class="danger" id="clear-settings">Clear local settings</button></div></section>${proxySettings()}</div>`;
 }
 
 function stopPlayer(): void {
+  stats.stop();
+  unbindPlayerControls?.();
+  unbindPlayerControls = undefined;
   hls?.destroy();
   hls = null;
-  playerStreamId = null;
   playerRetries = 0;
 }
 
@@ -240,7 +279,8 @@ function populateQualityLevels(): void {
 async function attemptPlay(video: HTMLVideoElement): Promise<void> {
   try {
     await video.play();
-  } catch {
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") return;
     video.muted = true;
     try {
       await video.play();
@@ -252,17 +292,17 @@ async function attemptPlay(video: HTMLVideoElement): Promise<void> {
 }
 
 function mountPlayer(stream: Stream): void {
-  if (playerStreamId === stream.id) return;
   const video = document.querySelector<HTMLVideoElement>("#player-video");
   const HlsCtor = window.Hls;
   stopPlayer();
-  playerStreamId = stream.id;
   if (!video || !HlsCtor || !HlsCtor.isSupported()) {
     showToast("This browser cannot play Twitch HLS streams.");
     return;
   }
+  stats.track({ id: stream.id, channel: stream.displayName, title: stream.title, kind: "Live" }, video);
   const instance = new HlsCtor({
-    lowLatencyMode: settings.lowLatency,
+    lowLatencyMode: !replayPosition && settings.lowLatency,
+    startPosition: replayPosition?.seconds ?? -1,
     liveSyncDurationCount: settings.lowLatency ? 2 : 4,
     enableWorker: true,
     backBufferLength: 30,
@@ -270,9 +310,13 @@ function mountPlayer(stream: Stream): void {
     maxBufferLength: 30,
     maxMaxBufferLength: 60,
     abrEwmaDefaultEstimate: 1_000_000,
-    ...(settings.lowLatency ? { liveMaxLatencyDurationCount: 8, maxLiveSyncPlaybackRate: 1.15 } : {}),
+    ...(!replayPosition && settings.lowLatency ? { liveMaxLatencyDurationCount: 8, maxLiveSyncPlaybackRate: 1.15 } : {}),
   });
   hls = instance;
+  unbindPlayerControls = bindPlayerControls(video, instance, showToast, replayPosition ? () => {
+    replayPosition = null;
+    mountPlayer(stream);
+  } : undefined);
   instance.attachMedia(video);
   instance.on(HlsCtor.Events.MANIFEST_PARSED, () => {
     playerRetries = 0;
@@ -281,6 +325,10 @@ function mountPlayer(stream: Stream): void {
   });
   instance.on(HlsCtor.Events.ERROR, (_event, data) => {
     if (!data?.fatal) return;
+    if (replayPosition && data.details === "manifestLoadError") {
+      showToast("Twitch could not provide this archive for local playback. Open it on Twitch or choose Go live.");
+      return;
+    }
     if (stream.isLive && settings.streamProxy && data.details === "manifestLoadError") {
       showToast("The stream proxy could not load this channel.");
       return;
@@ -297,14 +345,26 @@ function mountPlayer(stream: Stream): void {
     }
     showToast("Could not play this stream. Try another channel.");
   });
-  instance.loadSource(playbackUrl(stream.userName, stream.isLive, settings.streamProxy));
+  instance.loadSource(replayPosition ? `/api/dvr/master?video=${encodeURIComponent(replayPosition.id)}`
+    : playbackUrl(stream.userName, stream.isLive, settings.streamProxy, settings.playerType));
+  const fallback = document.querySelector<HTMLAnchorElement>("#open-current-replay");
+  if (fallback) {
+    fallback.hidden = !replayPosition;
+    if (replayPosition) fallback.href = replayUrls(replayPosition, location.hostname).page;
+  }
 }
 
 function render(): void {
+  // Directory requests can finish while an archive is playing. Keep its iframe mounted.
+  if (view === "archives" && document.getElementById("archives")) return;
+  disposeTimeline?.();
+  disposeTimeline = undefined;
   stopPlayer();
-  const content = view === "home" ? homeView() : view === "following" ? followingView() : view === "browse" ? browseView() : view === "watch" ? watchView() : settingsView();
+  if (view !== "watch") replayPosition = null;
+  const content = view === "home" ? homeView() : view === "following" ? followingView() : view === "browse" ? browseView() : view === "watch" ? watchView() : view === "archives" ? pageHeader("◷", "Past broadcasts", "Browse a channel’s recorded streams.") + '<section id="archives"></section>' : settingsView();
   app!.innerHTML = layout(content);
   bindEvents();
+  if (view === "archives") mountArchives(document.querySelector("#archives")!, provider, archiveLogin, url => imageUrl(url, settings), stats);
   if (view === "watch" && selectedStream && provider.mode !== "demo") mountPlayer(selectedStream);
 }
 
@@ -452,6 +512,7 @@ async function openStream(id: string): Promise<void> {
   if (!stream) return;
   stopChat();
   stopPlayer();
+  replayPosition = null;
   selectedStream = stream;
   view = "watch";
   chat = [];
@@ -514,7 +575,43 @@ function bindProxySettings(): void {
 }
 
 function bindEvents(): void {
+  stats.bind();
+  syncWatchPanels();
+  document.querySelectorAll<HTMLButtonElement>("[data-panel]").forEach(button => {
+    button.onclick = () => {
+      const panel = button.dataset.panel === "navigation" ? "navigation" : "chat";
+      const state = panelPreferences[narrowWatch.matches ? "narrow" : "wide"];
+      state[panel] = !state[panel];
+      syncWatchPanels();
+    };
+  });
   bindProxySettings();
+  document.querySelector("[data-archives]")?.addEventListener("click", () => {
+    archiveLogin = selectedStream?.userName ?? "";
+    stopChat();
+    view = "archives";
+    render();
+  });
+  if (selectedStream && view === "watch") {
+    const stream = selectedStream;
+    if (provider.mode !== "demo") disposeTimeline = bindBroadcastTimeline(stream, () => replayPosition && {
+      id: replayPosition.id, duration: hls?.latestLevelDetails?.edge ?? 0,
+    }, position => {
+      const video = document.querySelector<HTMLVideoElement>("#player-video");
+      if (video && replayPosition?.id === position.id && video.readyState) {
+        video.currentTime = position.seconds;
+        void attemptPlay(video);
+      } else {
+        replayPosition = position;
+        mountPlayer(stream);
+      }
+    });
+  }
+  const playerType = document.querySelector<HTMLSelectElement>("#player-type");
+  playerType?.addEventListener("change", () => {
+    settings.playerType = playerType.value === "embed" ? "embed" : "site";
+    saveSettings(settings);
+  });
   document.querySelectorAll<HTMLElement>("[data-view]").forEach((element) => element.addEventListener("click", () => {
     const next = element.dataset.view as View;
     if (next === "watch" && view === "watch") return;
@@ -535,6 +632,13 @@ function bindEvents(): void {
   }));
   document.querySelectorAll<HTMLElement>("[data-favorite]").forEach((element) => element.addEventListener("click", (event) => { event.stopPropagation(); toggleFavorite(element.dataset.favorite ?? ""); }));
   document.querySelectorAll<HTMLElement>("[data-open-twitch]").forEach((element) => element.addEventListener("click", () => { const url = safeExternalTwitchUrl(twitchChannelUrl(element.dataset.openTwitch ?? "")); if (url) window.open(url, "_blank", "noopener,noreferrer"); else showToast("That Twitch link could not be validated"); }));
+  bindChannelSearch(document.querySelector<HTMLInputElement>("#search-input")!, provider, url => imageUrl(url, settings), login => {
+    archiveLogin = login;
+    stopChat();
+    view = "archives";
+    document.querySelector("#archives")?.remove();
+    render();
+  });
   document.querySelector<HTMLFormElement>("#search-form")?.addEventListener("submit", (event) => { event.preventDefault(); query = document.querySelector<HTMLInputElement>("#search-input")?.value.trim() ?? ""; activeCategory = null; view = "home"; void loadStreams(); });
   document.querySelector<HTMLInputElement>("#search-input")?.addEventListener("keydown", (event) => { if (event.key === "/") event.stopPropagation(); });
   document.querySelector<HTMLSelectElement>("#quality-select")?.addEventListener("change", (event) => {
@@ -546,15 +650,6 @@ function bindEvents(): void {
     saveSettings(settings);
     showToast(height ? `Quality set to ${height}p` : "Quality set to auto");
   });
-  document.querySelectorAll<HTMLElement>("[data-player]").forEach((element) => element.addEventListener("click", () => {
-    const action = element.dataset.player;
-    const video = document.querySelector<HTMLVideoElement>("#player-video");
-    if (action === "fullscreen") { void (video ?? document.querySelector<HTMLElement>(".player"))?.requestFullscreen(); return; }
-    if (!video) { showToast("Open a live channel to use playback controls."); return; }
-    if (action === "play") { if (video.paused) void video.play(); else video.pause(); }
-    else if (action === "mute") video.muted = !video.muted;
-    else if (action === "pip") { if (document.pictureInPictureElement) void document.exitPictureInPicture(); else void video.requestPictureInPicture().catch(() => showToast("Picture-in-picture is unavailable.")); }
-  }));
   document.querySelector<HTMLButtonElement>("#connect-twitch")?.addEventListener("click", () => { const clientId = document.querySelector<HTMLInputElement>("#client-id")?.value.trim() ?? ""; if (!clientId) { showToast("Add your Twitch Client ID first"); return; } settings.clientId = clientId; saveSettings(settings); const state = createOAuthState(); localStorage.setItem(OAUTH_STATE_KEY, state); window.location.assign(twitchAuthorizeUrl(clientId, redirectUri, state)); });
   const saveCredential = (): void => {
     stopChat();
@@ -588,7 +683,7 @@ function bindEvents(): void {
 consumeOAuthCallback();
 document.addEventListener("keydown", (event) => {
   if (event.key === "/" && document.activeElement?.tagName !== "INPUT") { event.preventDefault(); document.querySelector<HTMLInputElement>("#search-input")?.focus(); }
-  if (event.key === "Escape" && view === "watch") { stopChat(); stopPlayer(); view = "home"; render(); }
+  if (event.key === "Escape" && view === "watch" && !document.fullscreenElement) { stopChat(); stopPlayer(); view = "home"; render(); }
 });
 
 void (async () => {

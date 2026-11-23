@@ -13,6 +13,7 @@ interface HlsErrorData {
 }
 
 interface HlsConfig {
+  startPosition?: number;
   lowLatencyMode?: boolean;
   liveSyncDurationCount?: number;
   liveMaxLatencyDurationCount?: number;
@@ -26,7 +27,7 @@ interface HlsConfig {
 }
 
 declare class Hls {
-  static readonly Events: { MANIFEST_PARSED: string; ERROR: string };
+  static readonly Events: { MANIFEST_PARSED: string; LEVEL_UPDATED: string; ERROR: string };
   static isSupported(): boolean;
   constructor(config?: HlsConfig);
   attachMedia(media: HTMLMediaElement): void;
@@ -34,6 +35,9 @@ declare class Hls {
   destroy(): void;
   startLoad(): void;
   recoverMediaError(): void;
+  readonly config: HlsConfig;
+  readonly latestLevelDetails: { fragmentStart: number; edge: number } | null;
+  readonly liveSyncPosition: number | null;
   readonly levels: HlsLevel[];
   currentLevel: number;
   on(event: string, callback: (event: unknown, data: HlsErrorData) => void): void;

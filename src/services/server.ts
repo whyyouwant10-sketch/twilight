@@ -1,4 +1,4 @@
-import type { Category, ChatMessage, Stream, StreamProvider } from "../types.js";
+import type { ArchivePage, ChannelMatch, Category, ChatMessage, Stream, StreamProvider } from "../types.js";
 
 async function api<T>(path: string): Promise<T> {
   const response = await fetch(path, { headers: { Accept: "application/json" } });
@@ -8,6 +8,16 @@ async function api<T>(path: string): Promise<T> {
 
 export class ServerProvider implements StreamProvider {
   readonly mode = "live" as const;
+
+  searchChannels(query: string): Promise<ChannelMatch[]> {
+    return api(`/api/twitch/channels?${new URLSearchParams({ q: query })}`);
+  }
+
+  getArchives(login: string, cursor?: string): Promise<ArchivePage | null> {
+    const params = new URLSearchParams({ channel: login });
+    if (cursor) params.set("cursor", cursor);
+    return api(`/api/twitch/archives?${params}`);
+  }
 
   async getFeaturedStreams(): Promise<Stream[]> {
     return api<Stream[]>("/api/twitch/streams?first=30");

@@ -217,3 +217,33 @@ test("enabled playback coordinates renditions before URI rewriting and preserves
   assert.deepEqual(await get(variant), filtered);
   assert.equal((await get(variant.replace(/timeline=.*/, "timeline=expired"))).status, 410);
 });
+
+test("player type persists, defaults to site and reaches only the direct live token request", async t => {
+  let raw;
+  const storage = { getItem: () => raw, setItem: (_key, value) => { raw = value; } };
+  for (const stored of [{}, { playerType: "invalid" }]) {
+    raw = JSON.stringify(stored);
+    assert.equal(loadSettings(storage).playerType, "site");
+  }
+  saveSettings({ ...defaultSettings(), playerType: "embed" }, storage);
+  assert.equal(loadSettings(storage).playerType, "embed");
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (_url, init) => {
+    requests.push(JSON.parse(init.body));
+    return Response.json({ data: { streamPlaybackAccessToken: { value: "token", signature: "sig" } } });
+  });
+  const upstream = mockNetwork(t, () => ({ body: "#EXTM3U\nhttps://a.ttvnw.net/live.m3u8" }));
+  for (const type of ["site", "embed"]) {
+    const path = playbackUrl("nova", true, "", type);
+    assert.equal(path, "/api/playback?channel=nova" + (type === "embed" ? "&playerType=embed" : ""));
+    assert.equal((await api(path)).status, 200);
+    assert.equal(requests.at(-1).variables.playerType, type);
+  }
+  assert.deepEqual(requests[1], { ...requests[0], variables: { ...requests[0].variables, playerType: "embed" } });
+  assert.deepEqual(upstream[0], upstream[1]);
+  assert.equal(playbackUrl("nova", false, "", "embed"), "/api/playback?channel=nova");
+  assert.equal(playbackUrl("nova", true, base, "embed"), playbackUrl("nova", true, base));
+  assert.equal((await api(playbackUrl("nova", true, base, "embed"))).status, 200);
+  assert.equal((await api("/api/playback?channel=nova&playerType=invalid")).status, 400);
+  assert.equal(requests.length, 2);
+});

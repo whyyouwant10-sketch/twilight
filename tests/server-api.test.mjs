@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { isAllowedTwitchMediaUrl, mapGqlCategory, mapGqlStream, rewritePlaylist, sanitizeLogin } from "../scripts/twitch-api.mjs";
+import { clearDiscoveryCache, fetchTopStreams, searchPublicStreams, isAllowedTwitchMediaUrl, mapGqlCategory, mapGqlStream, rewritePlaylist, sanitizeLogin } from "../scripts/twitch-api.mjs";
 
 test("media proxy only allows Twitch media hosts over https", () => {
   assert.equal(isAllowedTwitchMediaUrl("https://video-weaver.aps32.hls.ttvnw.net/v1/segment/a.ts"), true);
@@ -78,4 +78,23 @@ test("GraphQL game nodes map to the app Category shape with viewer counts", () =
     viewerCount: 412345,
   });
   assert.deepEqual(mapGqlCategory({}), { id: "", name: "", boxArtUrl: "", viewerCount: 0 });
+});
+
+test("search ranks live channel matches, supplements title matches and respects Twitch's featured limit", async t => {
+  clearDiscoveryCache();
+  t.after(clearDiscoveryCache);
+  const channel = { id: "1", broadcaster: { login: "shanks_ttv", displayName: "Shanks" } };
+  t.mock.method(globalThis, "fetch", async (_url, init) => {
+    const { variables } = JSON.parse(init.body);
+    if (variables.term) {
+      assert.equal(variables.term, "shanks");
+      return Response.json({ data: { searchFor: { channels: { items: [{ stream: null }, { stream: channel }] } } } });
+    }
+    assert.equal(variables.first, 30);
+    return Response.json({ data: { streams: { edges: [
+      { node: channel }, { node: { id: "2", title: "Playing with Shanks" } }, { node: { id: "3", title: "Other" } },
+    ] } } });
+  });
+  await fetchTopStreams(100);
+  assert.deepEqual((await searchPublicStreams(" Shanks ")).map(s => s.id), ["1", "2"]);
 });

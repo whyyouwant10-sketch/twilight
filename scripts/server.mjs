@@ -1,3 +1,4 @@
+import { dvrMaster, dvrMedia, rewriteDvrPlaylist } from "./dvr.mjs";
 import { IntervalFilter, filterConfig } from "./hls/filter.mjs";
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
@@ -7,6 +8,8 @@ import { buildImageTarget, checkImageSource, InvalidRelayUrl, playlistText, rela
 import { isPublicHttpsUrl, isStreamProxy } from "../src/lib/proxy-validation.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  fetchArchives,
+  fetchBroadcastReplay,
   fetchFollowedStreams,
   fetchGameStreams,
   fetchMasterPlaylist,
@@ -19,6 +22,7 @@ import {
   rewritePlaylist,
   sanitizeLogin,
   searchPublicStreams,
+  searchChannels,
 } from "./twitch-api.mjs";
 
 const root = join(fileURLToPath(new URL("..", import.meta.url)), "dist");
@@ -57,6 +61,28 @@ async function handleRelay(request, url, response, signal) {
   }
   const proxy = url.searchParams.get("proxy");
   const target = url.searchParams.get("url");
+  if (url.pathname === "/api/dvr/master") {
+    const id = url.searchParams.get("video") ?? "";
+    if (!/^\d+$/.test(id)) return sendJson(response, 400, { error: "Invalid replay" });
+    const playlist = await dvrMaster(id, signal);
+    response.writeHead(200, { "content-type": "application/vnd.apple.mpegurl", "cache-control": "no-store" });
+    return response.end(playlist);
+  }
+  if (url.pathname === "/api/dvr/media") {
+    const media = await dvrMedia(target, url.searchParams.get("key"), request.headers.range, signal);
+    if (media.status >= 400) { media.upstream.destroy(); return sendJson(response, media.status, { error: "Replay media unavailable" }); }
+    if (new URL(media.url).pathname.endsWith(".m3u8") || /mpegurl/i.test(media.upstream.headers["content-type"] ?? "")) {
+      const playlist = rewriteDvrPlaylist(await playlistText(media.upstream), media.url);
+      response.writeHead(200, { "content-type": "application/vnd.apple.mpegurl", "cache-control": "no-store" });
+      return response.end(playlist);
+    }
+    const headers = { ...relayHeaders, "cache-control": "no-store" };
+    for (const name of ["content-type", "content-range", "content-length", "accept-ranges"]) {
+      if (media.upstream.headers[name]) headers[name] = media.upstream.headers[name];
+    }
+    response.writeHead(media.status, headers);
+    return streamResponse(media.upstream, response);
+  }
   if (url.pathname === "/api/image") {
     const imageTarget = buildImageTarget(target, proxy);
     await checkImageSource(target, signal);
@@ -74,7 +100,9 @@ async function handleRelay(request, url, response, signal) {
   if (url.pathname === "/api/playback") {
     const channel = sanitizeLogin(url.searchParams.get("channel"));
     if (!channel) return sendJson(response, 400, { error: "Invalid channel" });
-    const master = proxy ? await fetchProxiedPlaylist(channel, proxy, signal) : await fetchMasterPlaylist(channel, signal);
+    const playerType = url.searchParams.get("playerType") ?? "site";
+    if (playerType !== "site" && playerType !== "embed") return sendJson(response, 400, { error: "Invalid player type" });
+    const master = proxy ? await fetchProxiedPlaylist(channel, proxy, signal) : await fetchMasterPlaylist(channel, signal, playerType);
     const session = intervalFilter.open(master.text, master.url, proxy);
     const playlist = rewritePlaylist(master.text, master.url, "/api/hls", proxy, session);
     response.writeHead(200, { "content-type": "application/vnd.apple.mpegurl", "cache-control": "no-store" });
@@ -137,11 +165,34 @@ export async function handleApi(request, url, response) {
       return sendJson(response, 200, data);
     }
 
+    if (url.pathname === "/api/twitch/channels") {
+      if (request.method !== "GET") return sendJson(response, 405, { error: "Method not allowed" });
+      const term = url.searchParams.get("q")?.trim();
+      if (!term || term.length > 100) return sendJson(response, 400, { error: "Invalid channel search" });
+      return sendJson(response, 200, await searchChannels(term));
+    }
+    if (url.pathname === "/api/twitch/archives") {
+      if (request.method !== "GET") return sendJson(response, 405, { error: "Method not allowed" });
+      const login = sanitizeLogin(url.searchParams.get("channel"));
+      const cursor = url.searchParams.get("cursor");
+      if (!login || (cursor && cursor.length > 2048)) return sendJson(response, 400, { error: "Invalid channel or cursor" });
+      return sendJson(response, 200, await fetchArchives(login, cursor));
+    }
+
+    if (url.pathname === "/api/twitch/replay") {
+      if (request.method !== "GET") return sendJson(response, 405, { error: "Method not allowed" });
+      const login = sanitizeLogin(url.searchParams.get("channel"));
+      const streamId = url.searchParams.get("stream") ?? "";
+      const videoId = url.searchParams.get("video");
+      if (!login || !/^\d+$/.test(streamId) || (videoId !== null && !/^\d+$/.test(videoId))) return sendJson(response, 400, { error: "Invalid broadcast" });
+      return sendJson(response, 200, await fetchBroadcastReplay(login, streamId, videoId));
+    }
+
     if (url.pathname === "/api/twitch/categories") {
       return sendJson(response, 200, await fetchTopGames(Number(url.searchParams.get("first") ?? 24)));
     }
 
-    if (["/api/playback", "/api/hls", "/api/image"].includes(url.pathname)) {
+    if (["/api/playback", "/api/hls", "/api/image", "/api/dvr/master", "/api/dvr/media"].includes(url.pathname)) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15_000);
       response.once("close", () => { clearTimeout(timer); controller.abort(); });
@@ -183,7 +234,7 @@ const server = createServer(async (request, response) => {
     }
     response.writeHead(200, {
       "content-type": types[extension] ?? "application/octet-stream",
-      "cache-control": extension === ".html" ? "no-cache" : "public, max-age=300",
+      "cache-control": [".html", ".js", ".css"].includes(extension) ? "no-cache" : "public, max-age=300",
       etag,
     });
     response.end(await readFile(target));
