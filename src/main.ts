@@ -507,8 +507,7 @@ function updateChatStatus(): void {
   element.textContent = provider.mode === "demo" ? "Demo" : chatStatus === "connected" ? "Live" : chatStatus === "connecting" ? "Connecting…" : chatStatus === "reconnecting" ? "Reconnecting…" : "Offline";
 }
 
-async function openStream(id: string): Promise<void> {
-  const stream = findStream(id);
+async function openStream(stream: Stream | undefined): Promise<void> {
   if (!stream) return;
   stopChat();
   stopPlayer();
@@ -622,7 +621,7 @@ function bindEvents(): void {
     if (next === "watch" && selectedStream && provider.mode !== "demo" && !chatClient) { render(); startLiveChat(selectedStream); return; }
     render();
   }));
-  document.querySelectorAll<HTMLElement>("[data-watch]").forEach((element) => element.addEventListener("click", () => void openStream(element.dataset.watch ?? "")));
+  document.querySelectorAll<HTMLElement>("[data-watch]").forEach((element) => element.addEventListener("click", () => void openStream(findStream(element.dataset.watch ?? ""))));
   document.querySelectorAll<HTMLElement>("[data-category]").forEach((element) => element.addEventListener("click", () => void loadCategory(element.dataset.category ?? "")));
   document.querySelectorAll<HTMLElement>("[data-clear-category]").forEach((element) => element.addEventListener("click", () => { activeCategory = null; void loadBrowse(); }));
   document.querySelectorAll<HTMLElement>("[data-refresh]").forEach((element) => element.addEventListener("click", () => {
@@ -632,7 +631,20 @@ function bindEvents(): void {
   }));
   document.querySelectorAll<HTMLElement>("[data-favorite]").forEach((element) => element.addEventListener("click", (event) => { event.stopPropagation(); toggleFavorite(element.dataset.favorite ?? ""); }));
   document.querySelectorAll<HTMLElement>("[data-open-twitch]").forEach((element) => element.addEventListener("click", () => { const url = safeExternalTwitchUrl(twitchChannelUrl(element.dataset.openTwitch ?? "")); if (url) window.open(url, "_blank", "noopener,noreferrer"); else showToast("That Twitch link could not be validated"); }));
-  bindChannelSearch(document.querySelector<HTMLInputElement>("#search-input")!, provider, url => imageUrl(url, settings), login => {
+  const searchInput = document.querySelector<HTMLInputElement>("#search-input")!;
+  let selection = 0;
+  searchInput.addEventListener("input", () => { selection++; });
+  bindChannelSearch(searchInput, provider, url => imageUrl(url, settings), async login => {
+    const request = ++selection;
+    try {
+      const matches = await provider.getFollowedStreams([login]);
+      if (!searchInput.isConnected || selection !== request) return;
+      const live = matches.find(stream => stream.isLive && stream.userName.toLowerCase() === login.toLowerCase());
+      if (live) { await openStream(live); return; }
+    } catch {
+      if (searchInput.isConnected && selection === request) showToast("Could not check whether this channel is live. Try again.");
+      return;
+    }
     archiveLogin = login;
     stopChat();
     view = "archives";
